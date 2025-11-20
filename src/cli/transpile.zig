@@ -73,6 +73,14 @@ fn transpile(ctx: zli.CommandContext) !void {
                 );
                 defer ctx.allocator.free(source);
 
+                // Check if the first line is 'use client' and skip transpilation if so
+                const first_line_end = std.mem.indexOfScalar(u8, source, '\n') orelse source.len;
+                const first_line = std.mem.trim(u8, source[0..first_line_end], " \t\r");
+                if (std.mem.eql(u8, first_line, "'use client'")) {
+                    log.info("Skipping client-side file: {s}", .{path});
+                    return;
+                }
+
                 const source_z = try ctx.allocator.dupeZ(u8, source);
                 defer ctx.allocator.free(source_z);
 
@@ -618,6 +626,14 @@ fn transpileFile(
         std.math.maxInt(usize),
     );
     defer allocator.free(source);
+
+    // Check if the first line is 'use client' and skip transpilation if so
+    const first_line_end = std.mem.indexOfScalar(u8, source, '\n') orelse source.len;
+    const first_line = std.mem.trim(u8, source[0..first_line_end], " \t\r");
+    if (std.mem.eql(u8, first_line, "'use client'")) {
+        log.info("Skipping client-side file: {s}", .{source_path});
+        return;
+    }
 
     const source_z = try allocator.dupeZ(u8, source);
     defer allocator.free(source_z);
