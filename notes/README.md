@@ -18,6 +18,20 @@ This directory contains design documents, brainstorming notes, and implementatio
 - Common issues and solutions
 - Phase 2 preview (adding interactivity)
 
+### [transpiler-mechanics.md](./transpiler-mechanics.md)
+**CRITICAL!** Deep dive into how the transpiler coordinates SSR and CSR.
+
+**Topics covered**:
+- The SSR ↔ CSR coordination problem (server placeholders + client hydration)
+- Key terminology: hydration, islands architecture, server components, serialization
+- 3 transpiler strategies (full CSR, SSR with takeover, islands)
+- Dual output approach (server version generates placeholder, client version has full logic)
+- Script injection and props passing via JSON
+- Detailed pseudocode for transpiler implementation
+- Data flow diagrams from build to hydration
+- Essential research resources (React hydration, Next.js, Leptos, Qwik)
+- Research terms: "hydration", "islands architecture", "progressive hydration", "SSR to CSR coordination"
+
 ### [client-side-rendering.md](./client-side-rendering.md)
 Comprehensive overview of implementing client-side rendering (CSR) in zx using WebAssembly.
 
