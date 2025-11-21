@@ -12,13 +12,42 @@ Implementing CSR in zx to enable interactive, client-side components using WebAs
 - Currently **skips** transpilation of 'use client' files
 - Transpiled files go to `.zx/` directory by default
 
-### Existing CSR Handling
+### Existing CSR Handling (Current - WRONG)
 The transpiler currently:
 1. Checks first line for `'use client'` directive
-2. Skips transpilation if found
+2. **SKIPS** transpilation if found ← **This needs to change!**
 3. Logs: "Skipping client-side file: {path}"
 
-**Key insight**: Files are being skipped, not transpiled differently!
+### Proposed Two-Pass Architecture (NEW)
+
+**Pass 1 (Server Build):**
+1. Detect `'use client'` directive
+2. **Generate placeholder component** (div with hydration markers)
+3. Add entry to `.zx/client_components.json` manifest
+4. Continue to next file
+
+**Pass 2 (Client Build - New!):**
+1. Read `.zx/client_components.json` manifest
+2. For each client component:
+   - Re-read original `.zx` file
+   - Transpile JSX → Zig (for WASM target)
+   - Export render functions
+3. Compile all client components into `app.wasm`
+
+### How Transpilation Actually Works
+
+**IMPORTANT**: The transpiler converts JSX syntax to Zig code. For example:
+
+```zig
+// Input (.zx file)
+<div>Hello</div>
+
+// Output (transpiled .zig file)
+var _zx = zx.initWithAllocator(allocator);
+return _zx.zx(.div, .{ .children = &.{ _zx.txt("Hello") } });
+```
+
+This means 'use client' components should use the **same JSX syntax** as server components. The transpiler needs to process the JSX and generate appropriate Zig code for the WASM target.
 
 ## 'use client' Directive
 
@@ -53,6 +82,45 @@ In Zig, behavior should be explicit. `'use client'` is a string literal that mag
 **Decision**: Stick with 'use client' for now (simplicity, familiarity), revisit later.
 
 ## Build Pipeline Design
+
+### Two-Pass Transpilation Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Pass 1: Server Build                    │
+│                   (zx transpile site/)                       │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+        pages/counter.zx ('use client')
+        pages/home.zx (normal)
+                              ↓
+                    ┌─────────┴──────────┐
+                    ↓                    ↓
+          .zx/pages/counter.zig    .zx/pages/home.zig
+          (placeholder div)         (full transpiled)
+                    ↓
+        .zx/client_components.json
+        [{ "id": "counter-...", "source": "pages/counter.zx" }]
+
+
+┌─────────────────────────────────────────────────────────────┐
+│                     Pass 2: Client Build                     │
+│             (zx build-client or similar)                     │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+        Read .zx/client_components.json
+                              ↓
+        For each entry, re-read .zx file
+                              ↓
+        Transpile JSX → Zig (WASM target)
+                              ↓
+        .zx/client/counter.zig
+        .zx/client/main.zig (entry point)
+                              ↓
+        zig build -Dtarget=wasm32-freestanding
+                              ↓
+        .zx/assets/app.wasm
+```
 
 ### Reference: zx-wasm-renderer
 Located at `../zx-wasm-renderer/`, provides working example of WASM rendering.
@@ -119,26 +187,45 @@ updateDom();
 
 ### Proposed Pipeline
 
-#### Phase 1: Single WASM Binary
+#### Phase 1: Single WASM Binary (Two-Pass)
+
+**Pass 1: Server Transpilation**
 ```
-Source (.zx files with 'use client')
+site/pages/*.zx
     ↓
-Transpile → Zig code
+zx transpile site/
     ↓
-Compile → Single app.wasm
+For files WITHOUT 'use client': Normal transpilation
+For files WITH 'use client': Generate placeholder + manifest entry
     ↓
-Deploy → Served with HTML/JS
+.zx/pages/*.zig (server code)
+.zx/client_components.json (manifest)
+```
+
+**Pass 2: Client WASM Build**
+```
+.zx/client_components.json
+    ↓
+zx build-client (new command)
+    ↓
+Read manifest, transpile each for WASM
+    ↓
+.zx/client/*.zig
+    ↓
+zig build -Dtarget=wasm32-freestanding
+    ↓
+.zx/assets/app.wasm
 ```
 
 **Pros**:
-- Simple to implement
-- One HTTP request
-- Easier debugging
+- Clear separation of server/client code
+- Manifest makes tracking easy
+- One WASM binary (simple deployment)
+- Can still lazy-load via runtime logic
 
 **Cons**:
-- Large initial download
-- Can't code-split
-- Everything loads upfront
+- Two build steps needed
+- Initial WASM may be large
 
 #### Phase 2+: Multiple WASM Files (Future)
 ```
@@ -181,10 +268,15 @@ components/button.zx → button.wasm
 **Implementation**:
 ```zig
 export var render_buffer: [4096]u8 = undefined;
+var render_arena = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
 
 export fn render() usize {
-    const html = component.render(allocator) catch return 0;
-    defer allocator.free(html);
+    _ = render_arena.reset(.retain_capacity);
+    const allocator = render_arena.allocator();
+    const ctx = zx.PageContext{ .arena = allocator };
+
+    const component = Component(ctx);
+    const html = component.toHtml(allocator) catch return 0;
 
     const len = @min(html.len, render_buffer.len);
     @memcpy(render_buffer[0..len], html[0..len]);
@@ -254,8 +346,11 @@ const DomOp = union(enum) {
 };
 
 export fn render() void {
+    const allocator = render_arena.allocator();
+    const ctx = zx.PageContext{ .arena = allocator };
+
     const old_vdom = current_vdom;
-    const new_vdom = component.render();
+    const new_vdom = componentToVdom(Component(ctx), allocator);
     const ops = diff(old_vdom, new_vdom);
 
     // Write ops to buffer for JS to consume
@@ -339,20 +434,31 @@ export fn render() void {
 
 **Example**:
 ```zig
+'use client'
+
 var count: u32 = 0;
+
+pub fn Component(ctx: zx.PageContext) zx.Component {
+    return (
+        <div>Count: {[count:d]}</div>
+    );
+}
 
 export fn increment() void {
     count += 1;
 }
 
-export fn render() void {
-    const html = std.fmt.allocPrint(
-        allocator,
-        "<div>Count: {d}</div>",
-        .{count}
-    ) catch return;
-    // ... copy to buffer
+export fn render() usize {
+    _ = render_arena.reset(.retain_capacity);
+    const allocator = render_arena.allocator();
+    const ctx = zx.PageContext{ .arena = allocator };
+    const component = Component(ctx);
+    const html = component.toHtml(allocator) catch return 0;
+    // ... copy to buffer and return length
 }
+
+const zx = @import("zx");
+var render_arena = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
 ```
 
 **Success criteria**:
@@ -366,21 +472,27 @@ export fn render() void {
 
 **Concept**:
 ```zig
-const Counter = struct {
-    pub fn Component(self: *Counter) ![]const u8 {
-        const count = useState(u32, "count", 0);
+'use client'
 
-        return try std.fmt.allocPrint(
-            allocator,
-            \\<div>
-            \\  Count: {d}
-            \\  <button onclick="setState('count', {d})">Increment</button>
-            \\</div>
-            ,
-            .{count.*, count.* + 1}
-        );
-    }
-};
+var count: u32 = 0;
+
+pub fn Component(ctx: zx.PageContext) zx.Component {
+    // Future: Use hooks for state management
+    // const count = useState(u32, 0);
+
+    return (
+        <div>
+            Count: {[count:d]}
+            <button onclick="increment()">Increment</button>
+        </div>
+    );
+}
+
+export fn increment() void {
+    count += 1;
+}
+
+const zx = @import("zx");
 ```
 
 **Challenges**:

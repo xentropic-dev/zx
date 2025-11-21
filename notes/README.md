@@ -32,6 +32,11 @@ This directory contains design documents, brainstorming notes, and implementatio
 - Essential research resources (React hydration, Next.js, Leptos, Qwik)
 - Research terms: "hydration", "islands architecture", "progressive hydration", "SSR to CSR coordination"
 
+**IMPORTANT**: Uses a **two-pass transpilation** system:
+- **Pass 1 (Server)**: 'use client' files generate placeholder components + manifest entry
+- **Pass 2 (Client)**: Manifest-listed files get transpiled for WASM target
+- Both passes use same JSX → Zig transpilation, just different outputs
+
 ### [client-side-rendering.md](./client-side-rendering.md)
 Comprehensive overview of implementing client-side rendering (CSR) in zx using WebAssembly.
 
@@ -97,9 +102,10 @@ Deep dive into memory management patterns for WASM client components.
 ### Current Status
 - ✅ Transpiler has 'use client' detection
 - ✅ Reference WASM renderer exists (`../zx-wasm-renderer`)
-- ❌ Client files are currently **skipped**, not transpiled
-- ❌ No WASM build pipeline yet
-- ❌ No JS runtime yet
+- ❌ Client files are currently **skipped** (need to generate placeholders instead!)
+- ❌ No Pass 2 transpiler for WASM build yet
+- ❌ No client components manifest system yet
+- ❌ No JS hydration runtime yet
 
 ### Key Files in Main Project
 - `src/cli/transpile.zig` - Main transpiler (lines 76-82, 630-636 handle 'use client')
@@ -112,12 +118,26 @@ Deep dive into memory management patterns for WASM client components.
   - `app/src/app.ts` - JS runtime (instantiate, read memory, update DOM)
   - `app/src/index.html` - HTML integration
 
-### Next Immediate Steps
-1. Modify `src/cli/transpile.zig` to transpile (not skip) 'use client' files
-2. Create client build system (new file: `src/cli/transpile/client_build.zig`)
-3. Generate client main entry point (`.zx/client_main.zig`)
-4. Create JavaScript runtime (`.zx/assets/wasm_runtime.js`)
-5. Test with simple hello world component
+### Next Immediate Steps (Two-Pass Architecture)
+
+**Phase 1: Server Transpilation (Pass 1)**
+1. Modify `src/cli/transpile.zig` line 79-81 to:
+   - Generate placeholder component (not skip!)
+   - Write to `.zx/client_components.json` manifest
+   - Include: component ID, name, source path
+2. Test: Run `zx transpile` and verify placeholders generate
+
+**Phase 2: Client Build (Pass 2 - NEW!)**
+3. Create `src/cli/build_client.zig` or add `zx build-client` command
+4. Read `.zx/client_components.json` manifest
+5. For each component: re-transpile for WASM target
+6. Generate `.zx/client/main.zig` entry point
+7. Compile to `.zx/assets/app.wasm`
+
+**Phase 3: Runtime**
+8. Create JavaScript hydration runtime (`.zx/assets/wasm_runtime.js`)
+9. Find placeholder divs, mount WASM components
+10. Test with simple hello world component
 
 ## Philosophy & Design Principles
 

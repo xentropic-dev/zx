@@ -17,19 +17,19 @@ Create `test/client/hello.zx`:
 ```zig
 'use client'
 
-pub const Component = struct {
-    pub fn render() ![]const u8 {
-        return
-            \\<div>
-            \\  <h1>Hello from WASM!</h1>
-            \\  <p>This is rendered client-side using Zig compiled to WebAssembly.</p>
-            \\</div>
-        ;
-    }
-};
+pub fn Component(ctx: zx.PageContext) zx.Component {
+    return (
+        <div>
+            <h1>Hello from WASM!</h1>
+            <p>This is rendered client-side using Zig compiled to WebAssembly.</p>
+        </div>
+    );
+}
+
+const zx = @import("zx");
 ```
 
-### Step 2: Modify Transpiler
+### Step 2: Modify Transpiler (Pass 1: Generate Placeholder)
 
 Edit `src/cli/transpile.zig`:
 
@@ -45,12 +45,96 @@ if (std.mem.eql(u8, first_line, "'use client'")) {
 ```zig
 const is_client_side = std.mem.eql(u8, first_line, "'use client'");
 if (is_client_side) {
-    log.info("Transpiling client-side file: {s}", .{path});
-    // Continue with client-specific transpilation
+    log.info("Generating placeholder for client component: {s}", .{path});
+    try handleClientComponent(allocator, path, output_path);
+    return; // Continue to next file after generating placeholder
 }
 ```
 
-### Step 3: Generate Client Main
+**Add new function**:
+```zig
+fn handleClientComponent(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    output_path: []const u8,
+) !void {
+    // Generate unique ID from path
+    const component_id = try generateComponentId(source_path);
+
+    // Generate placeholder server component
+    const placeholder = try std.fmt.allocPrint(allocator,
+        \\// AUTO-GENERATED: Server placeholder for 'use client' component
+        \\const zx = @import("zx");
+        \\
+        \\pub fn Component(ctx: zx.PageContext) zx.Component {{
+        \\    var _zx = zx.initWithAllocator(ctx.arena);
+        \\    return _zx.zx(.div, .{{
+        \\        .attributes = &.{{
+        \\            .{{ .name = "id", .value = "{s}" }},
+        \\            .{{ .name = "data-wasm-component", .value = "Component" }},
+        \\            .{{ .name = "data-wasm-mount", .value = "" }},
+        \\        }},
+        \\        .children = &.{{ _zx.txt("Loading...") }},
+        \\    }});
+        \\}}
+        \\
+        , .{component_id});
+    defer allocator.free(placeholder);
+
+    // Write placeholder to output
+    try std.fs.cwd().writeFile(.{ .sub_path = output_path, .data = placeholder });
+
+    // Add to manifest for Pass 2
+    try addToClientManifest(allocator, source_path, component_id);
+}
+```
+
+### Step 3: Implement Pass 2 - Client Build Command
+
+Create a new command to build client components:
+
+**New file**: `src/cli/build_client.zig`
+
+```zig
+const std = @import("std");
+
+pub fn buildClient(allocator: std.mem.Allocator) !void {
+    // Read manifest
+    const manifest = try std.fs.cwd().readFileAlloc(
+        allocator,
+        ".zx/client_components.json",
+        std.math.maxInt(usize),
+    );
+    defer allocator.free(manifest);
+
+    const components = try std.json.parseFromSlice(
+        []ComponentEntry,
+        allocator,
+        manifest,
+        .{},
+    );
+    defer components.deinit();
+
+    // Transpile each component for WASM
+    for (components.value) |entry| {
+        try transpileForWasm(allocator, entry.source_path, entry.id);
+    }
+
+    // Generate client main
+    try generateClientMain(allocator, components.value);
+
+    // Build WASM
+    try buildWasm(allocator);
+}
+
+const ComponentEntry = struct {
+    id: []const u8,
+    name: []const u8,
+    source_path: []const u8,
+};
+```
+
+### Step 4: Generate Client Main
 
 Create `.zx/client_main.zig`:
 
@@ -64,15 +148,19 @@ var render_arena = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
 export var render_buffer: [8192]u8 = undefined;
 
 // Import your component (adjust path as needed)
-const Component = @import("pages/hello.zig").Component;
+const hello = @import("pages/hello.zig");
 
 export fn render() usize {
     // Reset arena for fresh allocations
     _ = render_arena.reset(.retain_capacity);
     const allocator = render_arena.allocator();
 
-    // Render component
-    const html = Component.render() catch |err| {
+    // Create page context
+    const ctx = zx.PageContext{ .arena = allocator };
+
+    // Render component (returns zx.Component)
+    const component = hello.Component(ctx);
+    const html = component.toHtml(allocator) catch |err| {
         std.debug.print("Render error: {}\n", .{err});
         return 0;
     };
@@ -90,7 +178,7 @@ export fn cleanup() void {
 }
 ```
 
-### Step 4: Create Client Build Script
+### Step 5: Create Client Build Script
 
 Create `.zx/build_client.zig`:
 
@@ -130,7 +218,7 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-### Step 5: Build WASM
+### Step 6: Build WASM (Run Pass 2)
 
 ```bash
 cd .zx
@@ -139,7 +227,7 @@ zig build -Dbuild-file=build_client.zig
 
 This should produce `.zx/assets/app.wasm`.
 
-### Step 6: Create JavaScript Runtime
+### Step 7: Create JavaScript Runtime
 
 Create `.zx/assets/wasm_runtime.js`:
 
@@ -249,7 +337,7 @@ if (typeof window !== 'undefined') {
 }
 ```
 
-### Step 7: Create HTML Page
+### Step 8: Create HTML Page
 
 Create `.zx/index.html`:
 
@@ -319,7 +407,7 @@ Create `.zx/index.html`:
 </html>
 ```
 
-### Step 8: Serve and Test
+### Step 9: Serve and Test
 
 Start a local server:
 
@@ -343,7 +431,7 @@ Hello from WASM!
 This is rendered client-side using Zig compiled to WebAssembly.
 ```
 
-### Step 9: Verify
+### Step 10: Verify
 
 Open browser DevTools and check:
 
@@ -373,21 +461,16 @@ Modify `test/client/hello.zx`:
 
 var count: u32 = 0;
 
-pub const Component = struct {
-    pub fn render() ![]const u8 {
-        const allocator = std.heap.wasm_allocator;
-        return try std.fmt.allocPrint(allocator,
-            \\<div>
-            \\  <h1>Counter: {d}</h1>
-            \\  <button onclick="increment()">Increment</button>
-            \\  <button onclick="decrement()">Decrement</button>
-            \\  <button onclick="reset()">Reset</button>
-            \\</div>
-            ,
-            .{count}
-        );
-    }
-};
+pub fn Component(ctx: zx.PageContext) zx.Component {
+    return (
+        <div>
+            <h1>Counter: {[count:d]}</h1>
+            <button onclick="increment()">Increment</button>
+            <button onclick="decrement()">Decrement</button>
+            <button onclick="reset()">Reset</button>
+        </div>
+    );
+}
 
 export fn increment() void {
     count += 1;
@@ -400,6 +483,8 @@ export fn decrement() void {
 export fn reset() void {
     count = 0;
 }
+
+const zx = @import("zx");
 ```
 
 ### Step 2: Wire Up Events in JS
@@ -494,9 +579,12 @@ wasm-opt -Oz .zx/assets/app.wasm -o .zx/assets/app.opt.wasm
 
 **Cause**: Function not exported from WASM
 
-**Fix**: Make sure function is marked `export` in Zig:
+**Fix**: Make sure function is marked `export` in Zig. Also ensure the component is properly transpiled from JSX:
 ```zig
 export fn render() usize { // Note the 'export' keyword
+    // This calls the transpiled Component function
+    const component = hello.Component(ctx);
+    const html = component.toHtml(allocator) catch return 0;
     // ...
 }
 ```

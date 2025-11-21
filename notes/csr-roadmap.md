@@ -19,7 +19,7 @@ Enable client-side rendering in zx using WebAssembly, allowing Zig code to run i
 
 ### Tasks
 
-#### 1.1 Transpiler Changes
+#### 1.1 Transpiler Changes (Pass 1: Server Build)
 **File**: `src/cli/transpile.zig`
 
 Current behavior (lines 76-82, 630-636):
@@ -30,49 +30,72 @@ if (std.mem.eql(u8, first_line, "'use client'")) {
 }
 ```
 
-**Changes needed**:
+**Changes needed - Pass 1**:
 - [ ] Remove the `return` statement
-- [ ] Add flag to track client-side files
-- [ ] Continue transpilation with client-specific settings
-- [ ] Generate WASM-compatible Zig code
-  - No server APIs (file I/O, HTTP, etc)
-  - Use `wasm_allocator`
-  - Export render function
+- [ ] Instead, call `handleClientComponent()` function
+- [ ] Generate **placeholder component** with:
+  - Unique component ID (hash of path + name)
+  - Div with `data-wasm-component`, `data-wasm-mount` attributes
+  - "Loading..." text
+- [ ] Write manifest entry to `.zx/client_components.json`:
+  ```json
+  {
+    "id": "component-xyz",
+    "name": "ComponentName",
+    "source_path": "pages/component.zx"
+  }
+  ```
+- [ ] Continue to next file (don't skip!)
 
 **New transpiler output**:
 ```zig
-// Generated from component.zx with 'use client'
+// Generated from component.zx with 'use client' (transpiled JSX)
 const std = @import("std");
-const allocator = std.heap.wasm_allocator;
+const zx = @import("zx");
 
+var render_arena = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
 export var render_buffer: [4096]u8 = undefined;
 
+// Transpiled from JSX: <div>Hello from WASM!</div>
+pub fn Component(ctx: zx.PageContext) zx.Component {
+    var _zx = zx.initWithAllocator(ctx.arena);
+    return _zx.zx(
+        .div,
+        .{ .children = &.{ _zx.txt("Hello from WASM!") } },
+    );
+}
+
 export fn render() usize {
-    const html = Component.render() catch return 0;
-    defer allocator.free(html);
+    _ = render_arena.reset(.retain_capacity);
+    const allocator = render_arena.allocator();
+    const ctx = zx.PageContext{ .arena = allocator };
+
+    const component = Component(ctx);
+    const html = component.toHtml(allocator) catch return 0;
 
     const len = @min(html.len, render_buffer.len);
     @memcpy(render_buffer[0..len], html[0..len]);
     return len;
 }
-
-const Component = struct {
-    pub fn render() ![]const u8 {
-        return try std.fmt.allocPrint(allocator,
-            \\<div>Hello from WASM!</div>
-            , .{});
-    }
-};
 ```
 
-#### 1.2 Client Build System
-**New file**: `src/cli/transpile/client_build.zig`
+#### 1.2 Client Build System (Pass 2: Client Build)
+**New file**: `src/cli/build_client.zig` or new command `zx build-client`
 
-- [ ] Create WASM build configuration
-- [ ] Set target to `wasm32-freestanding`
-- [ ] Configure optimization (`.ReleaseSmall`)
-- [ ] Export memory and functions
-- [ ] Output to `.zx/assets/app.wasm`
+- [ ] Read `.zx/client_components.json` manifest
+- [ ] For each component entry:
+  - [ ] Re-read original `.zx` source file
+  - [ ] Parse and transpile JSX → Zig (same as server, but for WASM)
+  - [ ] Generate WASM-compatible code:
+    - Use `wasm_allocator` or arena
+    - Export `render()` function
+    - Export event handlers (increment, etc.)
+- [ ] Create client entry point (`.zx/client/main.zig`)
+- [ ] Build WASM binary:
+  - Target: `wasm32-freestanding`
+  - Optimization: `.ReleaseSmall`
+  - Export memory: `true`
+  - Output: `.zx/assets/app.wasm`
 
 **Build script template**:
 ```zig
@@ -320,6 +343,8 @@ async init(wasmPath) {
 
 **Pattern**:
 ```zig
+'use client'
+
 const Counter = struct {
     count: u32 = 0,
 
@@ -330,25 +355,34 @@ const Counter = struct {
     pub fn increment(self: *Counter) void {
         self.count += 1;
     }
-
-    pub fn render(self: Counter, alloc: std.mem.Allocator) ![]const u8 {
-        return try std.fmt.allocPrint(alloc,
-            "<div>Count: {d}</div>",
-            .{self.count}
-        );
-    }
 };
 
 var counter = Counter.init();
+
+pub fn Component(ctx: zx.PageContext) zx.Component {
+    return (
+        <div>Count: {[counter.count:d]}</div>
+    );
+}
 
 export fn increment() void {
     counter.increment();
 }
 
 export fn render() usize {
-    const html = counter.render(allocator) catch return 0;
-    // ...
+    _ = render_arena.reset(.retain_capacity);
+    const allocator = render_arena.allocator();
+    const ctx = zx.PageContext{ .arena = allocator };
+    const component = Component(ctx);
+    const html = component.toHtml(allocator) catch return 0;
+    const len = @min(html.len, render_buffer.len);
+    @memcpy(render_buffer[0..len], html[0..len]);
+    return len;
 }
+
+const zx = @import("zx");
+var render_arena = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
+export var render_buffer: [4096]u8 = undefined;
 ```
 
 #### 2.5 Testing
